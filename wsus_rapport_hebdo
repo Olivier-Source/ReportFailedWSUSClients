@@ -1,0 +1,128 @@
+#############################################
+# Author: Olivier CHALLET
+# Creation Date: 24/2/2021
+# Last Modified: 24/2/2021
+# Version: 1.0
+# Description: Script de génération de rapport WSUS
+# Attention: Le script est conçu pour être exécuter toutes les semaines en tache planifiée avec droits administrateur
+#############################################
+
+# Initialisation des variables de base habituelles
+
+$TodaysDate = Get-Date -Format yyyy-MM-dd
+$DateDuJour = Get-Date -Format dd-MM-yyyy
+$ReportPath = 'C:\Temp\WSUSReport\'
+$ReportName = "Hebdo_Report_"+$env:computername+"_"+$TodaysDate
+
+# Initialisation des variables pour envoi de Mail
+
+$SMTPServer = 'SMTSERVER'
+$SMTPPort = 25
+$EmailSender = 'EMAILSENDER@DOMAIN.LOCAL'
+$EmailRecipient = 'EMAILRECIPIENT@DOMAIN.LOCAL'
+$EmailSubject = "Rapport Hebdo du $DateDuJour sur $env:computername"
+$EmailBody = "
+Salut !`r`n`r`n
+Voici votre beau rapport automatise WSUS.`r
+Ce rapport permet de lister tous les serveurs ayant des erreurs d'installations de KB.`r`n
+Bonne journee."
+$EmailAttachment = "$ReportPath\$ReportName.csv"
+
+# Connection à la base de données
+
+$SQLServer = 'np:\\.\pipe\Microsoft##WID\tsql\query' #For Windows Server 2012 or others
+#$SQLServer = 'np:\\.\pipe\MSSQL$MICROSOFT##SSEE\sql\query' #For Windows Server 2008
+$SQLDatabase = 'SUSDB'
+$SQLQuery = "
+SELECT LEFT(COMP.Name,30) as 'Computer Name',
+count(COMP.Name) as 'Number of missing updates',
+COMP.IPAddress AS 'IP Address',
+COMP.LastSyncTime AS 'Last Sync Time',
+CTG.Name AS 'TargetGroupName',
+COMP.OSArchitecture AS 'OS Architecture',
+CASE
+CAST (COMP.OSMajorVersion AS varchar(50)) + CAST ('.' AS varchar(50))
++ CAST (COMP.OSMinorVersion AS varchar(50)) + CAST ('.' AS varchar(50))
++ CAST (COMP.OSBuildNumber AS varchar(50))
+WHEN '10.0.19041' THEN 'Windows Server 2019'
+WHEN '10.0.14393' THEN 'Windows Server 2016'
+WHEN '6.3.9600' THEN 'Windows Server 2012 R2'
+WHEN '6.1.7601' THEN 'Windows Server 2008 R2 SP1'
+WHEN '6.1.7600' THEN 'Windows Server 2008 R2 RTM'
+WHEN '6.0.6003' THEN 'Windows Server 2008'
+WHEN '5.2.3790' THEN 'Windows Server 2003'
+WHEN '5.1.2600' THEN 'Windows XP'
+ELSE 'Other'
+ 
+END AS 'Operating System'
+ 
+FROM
+[SUSDB].[PUBLIC_VIEWS].[vUpdateInstallationInfoBasic] UPDB
+LEFT JOIN [SUSDB].[PUBLIC_VIEWS].[vUpdate] UPD ON UPD.UpdateID = UPDB.UpdateID
+LEFT JOIN [SUSDB].[PUBLIC_VIEWS].[vComputerTarget] COMP ON COMP.ComputerTargetId = UPDB.ComputerTargetId
+LEFT JOIN [SUSDB].[PUBLIC_VIEWS].[vComputerGroupMembership] CGMS ON CGMS.ComputerTargetId = UPDB.ComputerTargetId
+LEFT JOIN [SUSDB].[PUBLIC_VIEWS].[vComputerTargetGroup] CTG ON CTG.ComputerTargetGroupId = CGMS.ComputerTargetGroupId 
+ 
+WHERE
+UPDB.State IN ('5') AND CTG.Name != ('All Computers') AND CTG.Name != ('Tous les ordinateurs') AND CTG.Name != ('STAGE1-PILOT') AND CTG.Name != ('STAGE2-PREPROD') AND CTG.Name != ('STAGE3-PROD') AND CTG.Name != ('STAGE4-PROD2')
+ 
+GROUP BY
+CTG.Name
+,COMP.Name
+,COMP.IPAddress
+,COMP.LastSyncTime
+,COMP.OSArchitecture
+,COMP.OSBuildNumber
+,COMP.OSMajorVersion
+,COMP.OSMinorVersion
+,COMP.OSServicePackMajorNumber
+ 
+ORDER BY CTG.Name"
+
+$SQLConnection = New-Object System.Data.SqlClient.SqlConnection
+$SQLConnection.ConnectionString = "Data Source=$SQLServer;Initial Catalog=$SQLDatabase;Integrated Security=sspi"
+$SQLCommand = New-Object System.Data.SqlClient.SqlCommand
+$SQLCommand.CommandText = $SQLQuery
+$SQLCommand.Connection = $SQLConnection
+$SQLAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+$SQLAdapter.SelectCommand = $SQLCommand
+$SQLDataset = New-Object System.Data.DataSet
+$SQLAdapter.Fill($SQLDataset) | Out-Null # Out-Null to remove unwanted output
+$SQLConnection.Close()
+
+$Data = foreach ($row in $SQLDataset.Tables[0].Rows)
+{
+ 
+    # to make it a bit tidyer we set new variables based on each "row" from the dataset
+    [string]$ComputerName = $row[0]
+    [int]$NumberOfMissingUpdates = $row[1]
+    [string]$IPAddress = $row[2]
+    [string]$LastSyncTime = $row[3]
+    [string]$TargetGroupName = $row[4]
+    [string]$ServerWsus = $env:computername
+    [string]$OSArchitecture = $row[5]
+    [string]$OperatingSystem = $row[6]
+ 
+    # create custom object for putting compliance data in
+    New-Object -TypeName PSObject -Property @{
+        ComputerName=$ComputerName
+        NumberOfMissingUpdates=$NumberOfMissingUpdates
+        IPAddress=$IPAddress
+        LastSyncTime=$LastSyncTime
+        TargetGroupName=$TargetGroupName
+        ServerWsus=$ServerWsus
+        OSArchitecture=$OSArchitecture
+        OperatingSystem=$OperatingSystem
+    } |
+ 
+    # Select is needed to list the data in the correct order in the report
+    Select-Object ComputerName,NumberOfMissingUpdates,IPAddress,LastSyncTime,TargetGroupName,ServerWsus,OSArchitecture,OperatingSystem
+}
+ 
+# using the ImportExcel module here to format the report, i.e. less manual work after
+$Data | Export-Csv -Path $ReportPath\$ReportName.csv -Force -Delimiter ";"
+
+Send-MailMessage -SmtpServer $SMTPServer -Port $SMTPPort -Subject $EmailSubject -Body $EmailBody -Attachments $EmailAttachment -From $EmailSender -To $EmailRecipient
+# Or send it to network path
+
+Remove-Item $EmailAttachment
